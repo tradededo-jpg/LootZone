@@ -1,4 +1,3 @@
-
 <?php
 header("Content-Type: application/json; charset=UTF-8");
 header("Access-Control-Allow-Origin: *");
@@ -22,7 +21,7 @@ if ($_SERVER["REQUEST_METHOD"] !== "POST") {
     reply(false, "method_not_allowed", 405);
 }
 
-$token = getenv("9095657966:AAEtCayzdO-ppfcy-Bwf78QiIv7eouWOPj0");
+$token = getenv("TELEGRAM_BOT_TOKEN");
 $chatId = "6970092473";
 
 if (!$token) {
