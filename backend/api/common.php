@@ -7,6 +7,13 @@ function lz_json($data, $code=200) {
     echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     exit;
 }
+function lz_fail($error, $status, $log=null) {
+    if ($log !== null) error_log('LootZone: ' . $log);
+    lz_json(['ok'=>false,'error'=>$error], $status);
+}
+function lz_len($s) {
+    return function_exists('mb_strlen') ? mb_strlen($s, 'UTF-8') : strlen($s);
+}
 function lz_db() {
     $url=getenv('DATABASE_URL'); if(!$url) throw new RuntimeException('DATABASE_URL missing');
     $p=parse_url($url); if(!$p||empty($p['host'])||empty($p['path'])) throw new RuntimeException('Invalid DATABASE_URL');
@@ -19,17 +26,42 @@ function lz_bearer() {
     if(preg_match('/^Bearer\s+(.+)$/i',$h,$m)) return trim($m[1]);
     $b=json_decode(file_get_contents('php://input'),true); return is_array($b)?trim((string)($b['id_token']??'')):'';
 }
+/* Returns user array, or null when the token is invalid/expired.
+   Throws RuntimeException when the check itself cannot run (missing config, network, Google outage). */
 function lz_verify_firebase_token($token) {
-    $key=getenv('FIREBASE_WEB_API_KEY'); if(!$key||!$token) return null;
-    if(!function_exists('curl_init')) return null;
+    if(!$token) return null;
+    $key=getenv('FIREBASE_WEB_API_KEY');
+    if(!$key) throw new RuntimeException('FIREBASE_WEB_API_KEY is not configured');
+    if(!function_exists('curl_init')) throw new RuntimeException('cURL extension is missing');
     $ch=curl_init('https://identitytoolkit.googleapis.com/v1/accounts:lookup?key='.rawurlencode($key));
     curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>json_encode(['idToken'=>$token]),CURLOPT_HTTPHEADER=>['Content-Type: application/json'],CURLOPT_RETURNTRANSFER=>true,CURLOPT_CONNECTTIMEOUT=>8,CURLOPT_TIMEOUT=>15]);
-    $raw=curl_exec($ch); $code=curl_getinfo($ch,CURLINFO_HTTP_CODE); curl_close($ch);
-    $d=is_string($raw)?json_decode($raw,true):null;
+    $raw=curl_exec($ch); $code=curl_getinfo($ch,CURLINFO_HTTP_CODE); $err=curl_error($ch); curl_close($ch);
+    if($raw===false) throw new RuntimeException('Identity Toolkit unreachable: '.$err);
+    if($code>=500||$code===0) throw new RuntimeException('Identity Toolkit HTTP '.$code);
+    // A rejected API key is a server configuration problem, not a logged-out user.
+    if(($code===400||$code===403)&&stripos($raw,'API key')!==false) throw new RuntimeException('FIREBASE_WEB_API_KEY rejected by Google');
+    $d=json_decode($raw,true);
     if($code<200||$code>=300||empty($d['users'][0]['localId'])) return null;
-    $u=$d['users'][0]; return ['uid'=>$u['localId'],'email'=>$u['email']??null,'name'=>$u['displayName']??null,'verified'=>!empty($u['emailVerified'])];
+    $u=$d['users'][0];
+    return ['uid'=>$u['localId'],'email'=>$u['email']??null,'name'=>$u['displayName']??null,'verified'=>!empty($u['emailVerified'])];
 }
-function lz_current_user() { $u=lz_verify_firebase_token(lz_bearer()); if(!$u) lz_json(['ok'=>false,'error'=>'unauthorized'],401); if(empty($u['verified'])) lz_json(['ok'=>false,'error'=>'email_not_verified'],403); $pdo=lz_db(); $q=$pdo->prepare('INSERT INTO app_users(firebase_uid,email,display_name) VALUES(:u,:e,:n) ON CONFLICT(firebase_uid) DO UPDATE SET email=EXCLUDED.email,display_name=EXCLUDED.display_name,updated_at=NOW()'); $q->execute([':u'=>$u['uid'],':e'=>$u['email'],':n'=>$u['name']]); return $u; }
+function lz_current_user() {
+    try {
+        $u=lz_verify_firebase_token(lz_bearer());
+    } catch(Throwable $e) {
+        lz_fail('auth_service_unavailable',503,'token check: '.$e->getMessage());
+    }
+    if(!$u) lz_json(['ok'=>false,'error'=>'unauthorized'],401);
+    if(empty($u['verified'])) lz_json(['ok'=>false,'error'=>'email_not_verified'],403);
+    try {
+        $pdo=lz_db();
+        $q=$pdo->prepare('INSERT INTO app_users(firebase_uid,email,display_name) VALUES(:u,:e,:n) ON CONFLICT(firebase_uid) DO UPDATE SET email=EXCLUDED.email,display_name=EXCLUDED.display_name,updated_at=NOW()');
+        $q->execute([':u'=>$u['uid'],':e'=>$u['email'],':n'=>$u['name']]);
+    } catch(Throwable $e) {
+        lz_fail('database_unavailable',503,'app_users upsert: '.$e->getMessage());
+    }
+    return $u;
+}
 function lz_fcm_access_token() {
     $raw=getenv('FIREBASE_SERVICE_ACCOUNT_JSON'); $sa=$raw?json_decode($raw,true):null;
     if(!is_array($sa)||empty($sa['client_email'])||empty($sa['private_key'])||empty($sa['project_id'])) return null;

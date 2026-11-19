@@ -1,7 +1,7 @@
 <?php
 require_once __DIR__.'/common.php';
-if($_SERVER['REQUEST_METHOD']==='OPTIONS'){http_response_code(204);exit;}
 header('Access-Control-Allow-Origin: *');header('Access-Control-Allow-Headers: Content-Type, Authorization');header('Access-Control-Allow-Methods: POST, OPTIONS');
+if($_SERVER['REQUEST_METHOD']==='OPTIONS'){http_response_code(204);exit;}
 if($_SERVER['REQUEST_METHOD']!=='POST') lz_json(['ok'=>false,'error'=>'method'],405);
 $raw=file_get_contents('php://input');if(!$raw||strlen($raw)>32768) lz_json(['ok'=>false,'error'=>'invalid_request'],413);
 $in=json_decode($raw,true);if(!is_array($in)) lz_json(['ok'=>false,'error'=>'invalid_json'],400);
@@ -10,7 +10,10 @@ $clean=function($k,$max=4000)use($in){$v=trim(strip_tags((string)($in[$k]??'')))
 $service=$clean('service',500);$name=$clean('name',180);$method=strtolower($clean('contact_method',20));$contact=$clean('contact_value',500);if($contact==='')$contact=$clean('phone',500);
 $email=$clean('email',254);$idempotency=$clean('idempotency_key',64);if($idempotency==='')$idempotency=bin2hex(random_bytes(16));$player=$clean('player_id',300);$jawaker=$clean('jawaker_id',300);$note=$clean('note',4000);$currency=strtoupper($clean('currency',12));
 if($service===''||$name===''||$contact==='')lz_json(['ok'=>false,'error'=>'required'],422);
-if(!in_array($method,['whatsapp','telegram'],true))$method='whatsapp';if($email!==''&&!filter_var($email,FILTER_VALIDATE_EMAIL))lz_json(['ok'=>false,'error'=>'invalid_email'],422);
+if(!in_array($method,['whatsapp','telegram'],true))$method='whatsapp';
+if($email!==''&&!filter_var($email,FILTER_VALIDATE_EMAIL))lz_json(['ok'=>false,'error'=>'invalid_email'],422);
+// WhatsApp needs a real phone number (7-15 digits, optional leading +). Telegram usernames are not validated here.
+if($method==='whatsapp'){$digits=preg_replace('/[\s\-()]/','',$contact);if(!preg_match('/^\+?\d{7,15}$/',$digits))lz_json(['ok'=>false,'error'=>'invalid_phone'],422);$contact=$digits;}
 $amount=null;$feePercent=null;$feeAmount=null;$totalDue=null;$a=$clean('amount',40);$fp=$clean('fee_percent',40);$fa=$clean('fee_amount',40);$td=$clean('total_due',40);
 if($currency==='USDT'){if(!is_numeric($a)||!is_numeric($fp)||!is_numeric($fa)||!is_numeric($td))lz_json(['ok'=>false,'error'=>'invalid_usdt_amount'],422);$amount=round((float)$a,2);$feePercent=(float)$fp;$feeAmount=round((float)$fa,2);$totalDue=round((float)$td,2);if($amount<=0||$amount>100000||abs($feePercent-7)>0.001||abs($feeAmount-round($amount*.07,2))>.02||abs($totalDue-($amount+$feeAmount))>.02)lz_json(['ok'=>false,'error'=>'invalid_usdt_amount'],422);}elseif($a!==''&&is_numeric($a))$amount=round((float)$a,2);
 try{
@@ -26,5 +29,5 @@ try{
 }catch(Throwable $e){if(isset($pdo)&&$pdo->inTransaction())$pdo->rollBack();error_log('LootZone order create: '.$e->getMessage());lz_json(['ok'=>false,'error'=>'database_error'],503);}
 // Telegram is a best-effort admin alert; it never controls order persistence.
 $sent=false;$bot=getenv('TELEGRAM_BOT_TOKEN');$chat=getenv('TELEGRAM_CHAT_ID');if($bot&&$chat&&function_exists('curl_init')){$txt="🛒 طلب جديد - LootZone\n🔖 ".$code."\n📦 ".$service."\n👤 ".$name."\n☎️ ".$contact;$ch=curl_init('https://api.telegram.org/bot'.$bot.'/sendMessage');curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>json_encode(['chat_id'=>$chat,'text'=>$txt],JSON_UNESCAPED_UNICODE),CURLOPT_HTTPHEADER=>['Content-Type: application/json'],CURLOPT_RETURNTRANSFER=>true,CURLOPT_CONNECTTIMEOUT=>8,CURLOPT_TIMEOUT=>12]);$r=curl_exec($ch);$c=curl_getinfo($ch,CURLINFO_HTTP_CODE);curl_close($ch);$j=is_string($r)?json_decode($r,true):null;$sent=$c>=200&&$c<300&&!empty($j['ok']);}
-if($sent){$q=$pdo->prepare('UPDATE orders SET telegram_notified=TRUE WHERE id=:id');$q->execute([':id'=>$order['id']]);}
+if($sent){try{$q=$pdo->prepare('UPDATE orders SET telegram_notified=TRUE WHERE id=:id');$q->execute([':id'=>$order['id']]);}catch(Throwable $e){error_log('LootZone telegram flag: '.$e->getMessage());}}
 lz_json(['ok'=>true,'order_code'=>$code,'status'=>'processing','created_at'=>$order['created_at'],'telegram_notified'=>$sent]);
